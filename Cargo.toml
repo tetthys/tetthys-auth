@@ -3,4 +3,11 @@ name = "tetthys-auth"
 version = "0.1.0"
 edition = "2021"
 
+description = "Framework-agnostic authentication/authorization core for Rust applications."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/tetthys/tetthys-auth"
+keywords = ["auth", "authentication", "authorization"]
+categories = ["authentication"]
+
 [dependencies]
