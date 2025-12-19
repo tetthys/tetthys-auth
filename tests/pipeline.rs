@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -43,10 +43,16 @@ impl Authorizable for TestUser {
 // ------------------------------
 // Test request-scope adapters
 // ------------------------------
+//
+// IMPORTANT:
+// - AuthContext pointer can be stored as *const () because it's a thin pointer.
+// - dyn AuthSession is a fat pointer; do NOT erase it into *const ().
+//   Store it directly using RefCell<Option<&'static dyn ...>>.
+//
 
 thread_local! {
     static CTX_PTR: Cell<*const ()> = const { Cell::new(std::ptr::null()) };
-    static SESS_PTR: Cell<*const ()> = const { Cell::new(std::ptr::null()) };
+    static SESS: RefCell<Option<&'static dyn AuthSession<TestUser>>> = const { RefCell::new(None) };
 }
 
 fn set_ctx_for_test(ctx: AuthContext<TestUser>) {
@@ -56,12 +62,12 @@ fn set_ctx_for_test(ctx: AuthContext<TestUser>) {
 
 fn set_session_for_test(sess: impl AuthSession<TestUser> + 'static) {
     let leaked: &'static dyn AuthSession<TestUser> = Box::leak(Box::new(sess));
-    SESS_PTR.with(|c| c.set(leaked as *const _ as *const ()));
+    SESS.with(|s| *s.borrow_mut() = Some(leaked));
 }
 
 fn clear_scope_for_test() {
     CTX_PTR.with(|c| c.set(std::ptr::null()));
-    SESS_PTR.with(|c| c.set(std::ptr::null()));
+    SESS.with(|s| *s.borrow_mut() = None);
 }
 
 impl AuthContextAccessor<TestUser> for () {
@@ -79,14 +85,7 @@ impl AuthContextAccessor<TestUser> for () {
 
 impl AuthSessionAccessor<TestUser> for () {
     fn get() -> Option<&'static dyn AuthSession<TestUser>> {
-        SESS_PTR.with(|c| {
-            let p = c.get();
-            if p.is_null() {
-                None
-            } else {
-                Some(unsafe { &*(p as *const dyn AuthSession<TestUser>) })
-            }
-        })
+        SESS.with(|s| *s.borrow())
     }
 }
 
@@ -350,7 +349,7 @@ fn sign_in_out_missing_session_is_an_error() {
     let store = SharedAuthStore::new(None);
 
     set_ctx_for_test(AuthContext::new(Box::new(SharedProvider { store })));
-    SESS_PTR.with(|c| c.set(std::ptr::null()));
+    SESS.with(|s| *s.borrow_mut() = None);
 
     let u = TestUser {
         id: 1,
