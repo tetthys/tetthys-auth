@@ -1,306 +1,253 @@
-# tetthys-auth
+# tetthys-auth  
+**Simple Usage Guide for Leptos + Axum SSR**
 
-Framework-agnostic authentication/authorization core for Rust applications.
+`tetthys-auth` is a **minimal, framework-agnostic authentication core**.  
+In a **Leptos 0.8+ + Axum SSR** setup, it lets you access authentication state anywhere via async helpers, without globals or framework coupling.
 
----
-
-## Core Concepts
-
-`tetthys-auth` separates authentication into clear responsibilities:
-
-| Responsibility | Trait |
-|----------------|------|
-| User identity  | `Authenticatable` |
-| Roles / permissions | `Authorizable` |
-| Load current user | `AuthProvider` |
-| Mutate login state | `AuthSession` |
-| Request cache & pipeline | `AuthContext` |
+This guide focuses only on **what you must implement and how to wire it**.
 
 ---
 
-## Defining a User
+## What tetthys-auth Does (In One Sentence)
 
-Your user type must implement `Authenticatable`.  
-To use authorization helpers, also implement `Authorizable`.
+> It resolves the **current `user_id` per request**, optionally loads a **User record**, and exposes simple async helpers.
+
+That’s it.
+
+---
+
+## What tetthys-auth Does NOT Do
+
+- No `User` trait
+- No roles or permissions
+- No cookie parsing logic
+- No database logic
+- No middleware magic
+
+All of that stays in **your app**, not in this crate.
+
+---
+
+## Core Helpers You Will Use
+
+Once wired, these work **anywhere** (SSR render, server functions, services):
 
 ```rust
-#[derive(Clone)]
-struct User {
-    id: u64,
-    roles: Vec<String>,
-    perms: Vec<String>,
-}
+auth_id::<UserId, User>().await?
+auth_user::<UserId, User>().await?
+auth_sign_in_by_user_id::<UserId, User>(&user_id).await?
+auth_sign_out::<UserId, User>().await?
 ````
 
-### Authenticatable
+---
+
+## What You Need to Implement (3 Small Pieces)
+
+### 1) Resolve `user_id` from the request
 
 ```rust
-use tetthys_auth::Authenticatable;
+use axum::body::Body;
+use axum::extract::Request;
+use tetthys_auth::AuthError;
 
-impl Authenticatable for User {
-    type Id = u64;
+struct MyUserIdResolver;
 
-    fn id(&self) -> Self::Id {
-        self.id
-    }
-
-    fn display_name(&self) -> Option<String> {
-        Some(format!("user#{}", self.id))
+impl RequestUserIdResolver<i64> for MyUserIdResolver {
+    fn resolve_user_id(
+        &self,
+        req: &Request<Body>,
+    ) -> Result<Option<i64>, AuthError> {
+        // Read cookie / header / JWT
+        Ok(None)
     }
 }
 ```
 
-### Authorizable
-
-```rust
-use tetthys_auth::Authorizable;
-
-impl Authorizable for User {
-    fn roles(&self) -> Vec<String> {
-        self.roles.clone()
-    }
-
-    fn permissions(&self) -> Vec<String> {
-        self.perms.clone()
-    }
-}
-```
+Purpose:
+➡ “Is this request authenticated? If yes, what is the user_id?”
 
 ---
 
-## AuthProvider
-
-An `AuthProvider` is responsible for **resolving the current user**.
+### 2) Load the User by `user_id` (optional but recommended)
 
 ```rust
-use tetthys_auth::{AuthProvider, AuthError};
+use tetthys_auth::{AuthError, BoxFut};
 
-struct FixedProvider {
-    user: Option<User>,
-}
+struct MyUserRepo;
 
-impl AuthProvider<User> for FixedProvider {
-    fn user(&self) -> Result<Option<User>, AuthError> {
-        Ok(self.user.clone())
-    }
-}
-```
-
-Providers may:
-
-* Return `Ok(None)` for unauthenticated requests
-* Return `Err(AuthError::ProviderFailed(_))` on failure
-
----
-
-## AuthContext (Request Scope)
-
-`AuthContext` represents **one request**.
-
-It:
-
-* Owns the provider
-* Caches the resolved user
-* Is invalidated on sign-in / sign-out
-
-You must expose it via `AuthContextAccessor`.
-
-### Minimal test / thread-local example
-
-```rust
-use std::cell::Cell;
-use tetthys_auth::{AuthContext, AuthContextAccessor};
-
-thread_local! {
-    static CTX_PTR: Cell<*const ()> = Cell::new(std::ptr::null());
-}
-
-fn set_ctx(ctx: AuthContext<User>) {
-    let leaked: &'static AuthContext<User> = Box::leak(Box::new(ctx));
-    CTX_PTR.with(|c| c.set(leaked as *const _ as *const ()));
-}
-
-impl AuthContextAccessor<User> for () {
-    fn get() -> Option<&'static AuthContext<User>> {
-        CTX_PTR.with(|c| {
-            let p = c.get();
-            if p.is_null() {
-                None
-            } else {
-                Some(unsafe { &*(p as *const AuthContext<User>) })
-            }
+impl RepoUserLoader<i64, User> for MyUserRepo {
+    fn find_by_user_id(
+        &self,
+        user_id: &i64,
+    ) -> BoxFut<'_, Result<Option<User>, AuthError>> {
+        Box::pin(async move {
+            // SELECT * FROM users WHERE id = ?
+            Ok(Some(User { id: *user_id }))
         })
     }
 }
 ```
 
----
-
-## Authentication Helpers
-
-All helpers return `Result<_, AuthError>`.
-
-### Auth state
-
-```rust
-auth_check::<User>()?      // bool
-auth_user::<User>()?       // Option<User>
-auth_require::<User>()?    // User or Unauthenticated
-```
-
-### User ID
-
-```rust
-auth_id::<User>()?         // Option<User::Id>
-auth_require_id::<User>()? // User::Id or Unauthenticated
-```
-
----
-
-## Authorization Helpers
-
-### Permissions
-
-```rust
-auth_can::<User>("posts.write")?
-auth_can_any::<User>(&["posts.read", "posts.write"])?
-```
-
-If the user has the `admin` role, all permissions are allowed by default.
-
-### Roles
-
-```rust
-auth_has_role::<User>("admin")?
-auth_has_any_role::<User>(&["admin", "staff"])?
-```
-
----
-
-## Provider Chaining
-
-Multiple providers can be evaluated in order.
-
-```rust
-use tetthys_auth::ChainProvider;
-
-let chain = ChainProvider::new(vec![
-    Box::new(provider_a),
-    Box::new(provider_b),
-]);
-
-set_ctx(AuthContext::new(Box::new(chain)));
-```
-
-Behavior:
-
-* Providers are queried in order
-* The first `Some(user)` wins
-* Results are cached per request
-
----
-
-## Request-Level Caching
-
-Within a single request:
-
-```rust
-auth_user::<User>()?;
-auth_id::<User>()?;
-auth_can::<User>("posts.read")?;
-```
-
-The provider is called **only once**.
-
----
-
-## AuthSession (Sign-in / Sign-out)
-
-`AuthSession` mutates the authentication state.
-
-```rust
-use tetthys_auth::{AuthSession, AuthError};
-
-struct Session;
-
-impl AuthSession<User> for Session {
-    fn sign_in(&self, user: &User) -> Result<(), AuthError> {
-        Ok(())
-    }
-
-    fn sign_out(&self) -> Result<(), AuthError> {
-        Ok(())
-    }
-}
-```
-
-You must expose it via `AuthSessionAccessor`.
-
-```rust
-use std::cell::RefCell;
-use tetthys_auth::AuthSessionAccessor;
-
-thread_local! {
-    static SESS: RefCell<Option<&'static dyn AuthSession<User>>> = RefCell::new(None);
-}
-
-impl AuthSessionAccessor<User> for () {
-    fn get() -> Option<&'static dyn AuthSession<User>> {
-        SESS.with(|s| *s.borrow())
-    }
-}
-```
-
----
-
-## Sign In / Sign Out
-
-```rust
-auth_sign_in::<User>(&user)?;
-auth_sign_out::<User>()?;
-```
-
 Notes:
 
-* Missing session → `AuthError::MissingSession`
-* Automatically invalidates `AuthContext` cache
+* Returning `None` is valid (deleted user, stale session).
+* In that case `auth_user()` returns `None`.
 
 ---
 
-## Errors
+### 3) Mutate the session using `user_id`
 
 ```rust
-AuthError::MissingContext
-AuthError::MissingSession
-AuthError::Unauthenticated
-AuthError::ProviderFailed(String)
+use tetthys_auth::{AuthError, BoxFut};
+
+struct MySessionMutator;
+
+impl RequestUserIdSessionMutator<i64> for MySessionMutator {
+    fn sign_in_by_user_id(
+        &self,
+        req: &Request<Body>,
+        user_id: &i64,
+    ) -> BoxFut<'_, Result<(), AuthError>> {
+        Box::pin(async {
+            // Set cookie / session row
+            Ok(())
+        })
+    }
+
+    fn sign_out(
+        &self,
+        req: &Request<Body>,
+    ) -> BoxFut<'_, Result<(), AuthError>> {
+        Box::pin(async {
+            // Clear cookie / delete session row
+            Ok(())
+        })
+    }
+}
+```
+
+Purpose:
+➡ “Persist or clear authentication state.”
+
+---
+
+## Wiring in Axum (One Time)
+
+Create shared adapter state:
+
+```rust
+use std::sync::Arc;
+use tetthys_auth::adapters::leptos_axum_ssr::AuthAdapterState;
+
+let auth_state = AuthAdapterState::<i64, User>::new(
+    Arc::new(MyUserIdResolver),
+    Arc::new(MyUserRepo),
+    Some(Arc::new(MySessionMutator)),
+);
+```
+
+Attach it to your Axum app state.
+
+---
+
+## Server Functions Route (Required)
+
+```rust
+use axum::routing::post;
+use tetthys_auth::adapters::leptos_axum_ssr::leptos_server_fns_handler_with_auth;
+
+Router::new()
+    .route(
+        "/api/*fn_name",
+        post(leptos_server_fns_handler_with_auth::<i64, User, AppState>),
+    )
+    .with_state(app_state);
+```
+
+This makes auth helpers work inside `#[server]` functions.
+
+---
+
+## SSR Rendering Route (Required)
+
+```rust
+use tetthys_auth::adapters::leptos_axum_ssr::leptos_ssr_render_handler_with_auth;
+
+Router::new().fallback(
+    leptos_ssr_render_handler_with_auth::<i64, User, AppState, _>(
+        app_state,
+        leptos_options,
+        || view! { <App/> },
+    ),
+);
+```
+
+This makes auth helpers work during SSR rendering.
+
+---
+
+## Using Auth Helpers (Examples)
+
+### Get current user id
+
+```rust
+let user_id = auth_id::<i64, User>().await?;
+```
+
+### Get current user
+
+```rust
+if let Some(user) = auth_user::<i64, User>().await? {
+    // authenticated
+}
+```
+
+### Require authentication
+
+```rust
+let user = auth_require::<i64, User>().await?;
+```
+
+### Sign in
+
+```rust
+auth_sign_in_by_user_id::<i64, User>(&user_id).await?;
+```
+
+### Sign out
+
+```rust
+auth_sign_out::<i64, User>().await?;
 ```
 
 ---
 
-## Quick Start Example
+## Mental Model (Keep This)
 
-```rust
-let user = User {
-    id: 1,
-    roles: vec!["admin".into()],
-    perms: vec![],
-};
-
-set_ctx(AuthContext::new(Box::new(FixedProvider {
-    user: Some(user),
-})));
-
-assert!(auth_check::<User>()?);
-assert!(auth_can::<User>("anything.at.all")?);
-```
+* Authentication = **user_id exists or not**
+* Session = **store user_id**
+* User = **optional materialization**
+* Everything is **request-scoped**
+* No globals, no magic
 
 ---
 
-## Design Summary
+## Common Errors
 
-* No global singletons
-* Explicit request boundaries
-* Provider-based authentication
-* Clear separation of concerns
-* Highly testable
+| Error             | Meaning                                    |
+| ----------------- | ------------------------------------------ |
+| `MissingContext`  | Auth not injected into SSR/server-fns      |
+| `Unauthenticated` | No user_id                                 |
+| `MissingSession`  | sign-in/out called without session mutator |
+
+---
+
+## That’s It
+
+If you understand:
+
+* “I resolve user_id”
+* “I load user by id”
+* “I store/clear user_id”
+
+…then you understand `tetthys-auth`.
