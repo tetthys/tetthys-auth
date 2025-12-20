@@ -1,6 +1,6 @@
 [package]
 name = "tetthys-auth"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 description = "Framework-agnostic authentication/authorization core for Rust applications."
@@ -11,3 +11,6 @@ keywords = ["auth", "authentication", "authorization"]
 categories = ["authentication"]
 
 [dependencies]
+
+[dev-dependencies]
+futures = "0.3"
