@@ -4,12 +4,18 @@ use crate::contracts::{
     AuthError, BoxFut, CurrentUserIdProvider, UserIdSession, UserLoader,
 };
 
-#[derive(Default)]
 struct Cache<UserId, User> {
-    // English comment: Cached user_id resolution result for this request scope.
     user_id: Option<Result<Option<UserId>, AuthError>>,
-    // English comment: Cached user load result for this request scope.
     user: Option<Result<Option<User>, AuthError>>,
+}
+
+impl<UserId, User> Default for Cache<UserId, User> {
+    fn default() -> Self {
+        Self {
+            user_id: None,
+            user: None,
+        }
+    }
 }
 
 #[derive(Clone)]
