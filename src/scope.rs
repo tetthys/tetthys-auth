@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::engine::AuthEngine;
 
 thread_local! {
+    // English comment: TLS is per-thread; we still keep Send+Sync here so downcast requires Engine: Send+Sync.
     static TLS_ENGINE: RefCell<Option<Arc<dyn Any + Send + Sync>>> = const { RefCell::new(None) };
 }
 
@@ -40,6 +41,7 @@ where
     TLS_ENGINE.with(|cell| {
         cell.borrow()
             .as_ref()
+            // English comment: downcast requires T: Any + Send + Sync.
             .and_then(|any_arc| any_arc.clone().downcast::<AuthEngine<UserId, User>>().ok())
     })
 }

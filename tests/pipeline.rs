@@ -152,9 +152,12 @@ fn pipeline_unauthenticated_basics() {
     assert!(matches!(e, AuthError::MissingContext));
 
     // Engine with fixed None
-    let idp = Arc::new(FixedUserIdProvider::<i64>(None));
+    let idp = Arc::new(FixedUserIdProvider::<i64>(None))
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+
     let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser>>;
+        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
+
     let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
 
     let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
@@ -172,9 +175,12 @@ fn pipeline_unauthenticated_basics() {
 
 #[test]
 fn pipeline_authenticated_id_and_user() {
-    let idp = Arc::new(FixedUserIdProvider::<i64>(Some(7)));
+    let idp = Arc::new(FixedUserIdProvider::<i64>(Some(7)))
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+
     let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser>>;
+        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
+
     let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
     let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
 
@@ -191,13 +197,15 @@ fn user_id_chain_provider_order_and_fallback() {
     let calls_b = Arc::new(AtomicUsize::new(0));
 
     let p1 = Arc::new(CountingUserIdProvider::new(calls_a.clone(), None))
-        as Arc<dyn CurrentUserIdProvider<i64>>;
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
     let p2 = Arc::new(CountingUserIdProvider::new(calls_b.clone(), Some(9)))
-        as Arc<dyn CurrentUserIdProvider<i64>>;
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
 
-    let chain = Arc::new(ChainUserIdProvider::new(vec![p1, p2]));
+    let chain = Arc::new(ChainUserIdProvider::new(vec![p1, p2]))
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+
     let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser>>;
+        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
 
     let engine = Arc::new(AuthEngine::new(chain, Some(loader), None));
     let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
@@ -214,9 +222,11 @@ fn engine_caches_user_id_and_user_per_request_scope() {
     let id_calls = Arc::new(AtomicUsize::new(0));
     let user_calls = Arc::new(AtomicUsize::new(0));
 
-    let idp = Arc::new(CountingUserIdProvider::new(id_calls.clone(), Some(3)));
+    let idp = Arc::new(CountingUserIdProvider::new(id_calls.clone(), Some(3)))
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+
     let loader = Arc::new(CountingUserLoader::new(user_calls.clone()))
-        as Arc<dyn UserLoader<i64, TestUser>>;
+        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
 
     let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
     let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
@@ -233,9 +243,12 @@ fn engine_caches_user_id_and_user_per_request_scope() {
 #[test]
 fn provider_errors_propagate() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let idp = Arc::new(CountingUserIdProvider::failing(calls.clone()));
+
+    let idp = Arc::new(CountingUserIdProvider::failing(calls.clone()))
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+
     let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser>>;
+        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
 
     let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
     let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
@@ -247,9 +260,11 @@ fn provider_errors_propagate() {
 
 #[test]
 fn user_loader_can_return_none_when_user_missing() {
-    let idp = Arc::new(FixedUserIdProvider::<i64>(Some(10)));
+    let idp = Arc::new(FixedUserIdProvider::<i64>(Some(10)))
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+
     let loader = Arc::new(CountingUserLoader::missing(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser>>;
+        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
 
     let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
     let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
@@ -266,11 +281,13 @@ fn sign_in_out_updates_user_id_and_invalidates_cache() {
     let store = SharedIdStore::new(None);
 
     let idp = Arc::new(StoreUserIdProvider { store: store.clone() })
-        as Arc<dyn CurrentUserIdProvider<i64>>;
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+
     let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser>>;
+        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
+
     let session = Arc::new(StoreUserIdSession { store: store.clone() })
-        as Arc<dyn UserIdSession<i64>>;
+        as Arc<dyn UserIdSession<i64> + Send + Sync>;
 
     let engine = Arc::new(AuthEngine::new(idp, Some(loader), Some(session)));
     let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
@@ -291,9 +308,12 @@ fn sign_in_out_updates_user_id_and_invalidates_cache() {
 
 #[test]
 fn sign_in_out_missing_session_is_an_error() {
-    let idp = Arc::new(FixedUserIdProvider::<i64>(None));
+    let idp = Arc::new(FixedUserIdProvider::<i64>(None))
+        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+
     let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser>>;
+        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
+
     let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
     let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
 

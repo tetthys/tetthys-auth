@@ -21,11 +21,12 @@ where
 }
 
 pub struct ChainUserIdProvider<UserId> {
-    providers: Vec<Arc<dyn CurrentUserIdProvider<UserId>>>,
+    // English comment: Store only thread-safe providers, so the chain can be used in Send futures.
+    providers: Vec<Arc<dyn CurrentUserIdProvider<UserId> + Send + Sync>>,
 }
 
 impl<UserId> ChainUserIdProvider<UserId> {
-    pub fn new(providers: Vec<Arc<dyn CurrentUserIdProvider<UserId>>>) -> Self {
+    pub fn new(providers: Vec<Arc<dyn CurrentUserIdProvider<UserId> + Send + Sync>>) -> Self {
         Self { providers }
     }
 }

@@ -1,8 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::contracts::{
-    AuthError, BoxFut, CurrentUserIdProvider, UserIdSession, UserLoader,
-};
+use crate::contracts::{AuthError, BoxFut, CurrentUserIdProvider, UserIdSession, UserLoader};
 
 struct Cache<UserId, User> {
     user_id: Option<Result<Option<UserId>, AuthError>>,
@@ -20,9 +18,11 @@ impl<UserId, User> Default for Cache<UserId, User> {
 
 #[derive(Clone)]
 pub struct AuthEngine<UserId, User> {
-    user_id_provider: Arc<dyn CurrentUserIdProvider<UserId>>,
-    user_loader: Option<Arc<dyn UserLoader<UserId, User>>>,
-    session: Option<Arc<dyn UserIdSession<UserId>>>,
+    // English comment: Use +Sync trait objects so Arc<dyn Trait> becomes Send and can be captured
+    // inside Send futures (BoxFut is typically Future + Send).
+    user_id_provider: Arc<dyn CurrentUserIdProvider<UserId> + Send + Sync>,
+    user_loader: Option<Arc<dyn UserLoader<UserId, User> + Send + Sync>>,
+    session: Option<Arc<dyn UserIdSession<UserId> + Send + Sync>>,
     cache: Arc<Mutex<Cache<UserId, User>>>,
 }
 
@@ -32,9 +32,9 @@ where
     User: Clone + Send + Sync + 'static,
 {
     pub fn new(
-        user_id_provider: Arc<dyn CurrentUserIdProvider<UserId>>,
-        user_loader: Option<Arc<dyn UserLoader<UserId, User>>>,
-        session: Option<Arc<dyn UserIdSession<UserId>>>,
+        user_id_provider: Arc<dyn CurrentUserIdProvider<UserId> + Send + Sync>,
+        user_loader: Option<Arc<dyn UserLoader<UserId, User> + Send + Sync>>,
+        session: Option<Arc<dyn UserIdSession<UserId> + Send + Sync>>,
     ) -> Self {
         Self {
             user_id_provider,
@@ -76,11 +76,13 @@ where
     }
 
     pub fn check(&self) -> BoxFut<'_, Result<bool, AuthError>> {
-        Box::pin(async move { Ok(self.user_id().await?.is_some()) })
+        let me = self.clone();
+        Box::pin(async move { Ok(me.user_id().await?.is_some()) })
     }
 
     pub fn require_user_id(&self) -> BoxFut<'_, Result<UserId, AuthError>> {
-        Box::pin(async move { self.user_id().await?.ok_or(AuthError::Unauthenticated) })
+        let me = self.clone();
+        Box::pin(async move { me.user_id().await?.ok_or(AuthError::Unauthenticated) })
     }
 
     pub fn user(&self) -> BoxFut<'_, Result<Option<User>, AuthError>> {
@@ -131,7 +133,8 @@ where
     }
 
     pub fn require(&self) -> BoxFut<'_, Result<User, AuthError>> {
-        Box::pin(async move { self.user().await?.ok_or(AuthError::Unauthenticated) })
+        let me = self.clone();
+        Box::pin(async move { me.user().await?.ok_or(AuthError::Unauthenticated) })
     }
 
     pub fn sign_in_by_user_id(&self, user_id: &UserId) -> BoxFut<'_, Result<(), AuthError>> {
