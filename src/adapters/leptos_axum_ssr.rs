@@ -6,6 +6,7 @@ use axum::body::Body;
 use axum::extract::{FromRef, Request, State};
 use axum::response::IntoResponse;
 use leptos::prelude::*;
+use leptos::prelude::LeptosOptions;
 use leptos_axum::{handle_server_fns_with_context, render_app_to_stream_with_context};
 
 use crate::contracts::{
@@ -154,7 +155,7 @@ where
 
 pub fn leptos_ssr_render_handler_with_auth<UserId, User, S, IV>(
     app_state: S,
-    leptos_options: leptos::LeptosOptions,
+    leptos_options: LeptosOptions,
     app_fn: impl Fn() -> IV + Clone + Send + 'static,
 ) -> impl axum::handler::Handler<(), S>
 where
