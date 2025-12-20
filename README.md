@@ -1,7 +1,8 @@
-# tetthys-auth  
+# tetthys-auth
+
 **Simple Usage Guide for Leptos + Axum SSR**
 
-`tetthys-auth` is a **minimal, framework-agnostic authentication core**.  
+`tetthys-auth` is a **minimal, framework-agnostic authentication core**.
 In a **Leptos 0.8+ + Axum SSR** setup, it lets you access authentication state anywhere via async helpers, without globals or framework coupling.
 
 This guide focuses only on **what you must implement and how to wire it**.
@@ -18,11 +19,11 @@ That’s it.
 
 ## What tetthys-auth Does NOT Do
 
-- No `User` trait
-- No roles or permissions
-- No cookie parsing logic
-- No database logic
-- No middleware magic
+* No `User` trait
+* No roles or permissions
+* No cookie parsing logic
+* No database logic
+* No middleware magic (you wire request-scoped injection yourself)
 
 All of that stays in **your app**, not in this crate.
 
@@ -37,28 +38,28 @@ auth_id::<UserId, User>().await?
 auth_user::<UserId, User>().await?
 auth_sign_in_by_user_id::<UserId, User>(&user_id).await?
 auth_sign_out::<UserId, User>().await?
-````
+```
 
 ---
 
-## What You Need to Implement (3 Small Pieces)
+## Contracts You Implement (3 Small Pieces)
 
-### 1) Resolve `user_id` from the request
+> Note: All trait objects are used behind `Arc<dyn ... + Send + Sync>`.
+> Implementations must be thread-safe (or wrap internal state with `Arc<Mutex<...>>`, etc).
+
+### 1) Resolve current `user_id` (per request)
 
 ```rust
-use axum::body::Body;
-use axum::extract::Request;
-use tetthys_auth::AuthError;
+use tetthys_auth::{AuthError, BoxFut, CurrentUserIdProvider};
 
-struct MyUserIdResolver;
+struct MyUserIdProvider;
 
-impl RequestUserIdResolver<i64> for MyUserIdResolver {
-    fn resolve_user_id(
-        &self,
-        req: &Request<Body>,
-    ) -> Result<Option<i64>, AuthError> {
-        // Read cookie / header / JWT
-        Ok(None)
+impl CurrentUserIdProvider<i64> for MyUserIdProvider {
+    fn current_user_id(&self) -> BoxFut<'_, Result<Option<i64>, AuthError>> {
+        Box::pin(async move {
+            // Return Ok(Some(user_id)) if authenticated, Ok(None) if not.
+            Ok(None)
+        })
     }
 }
 ```
@@ -66,23 +67,29 @@ impl RequestUserIdResolver<i64> for MyUserIdResolver {
 Purpose:
 ➡ “Is this request authenticated? If yes, what is the user_id?”
 
+**Where does request data come from?**
+In SSR, the typical pattern is: **middleware extracts cookie/header → stores user_id into request-scoped state → provider reads from that state** (see “Wiring” section).
+
 ---
 
 ### 2) Load the User by `user_id` (optional but recommended)
 
 ```rust
-use tetthys_auth::{AuthError, BoxFut};
+use tetthys_auth::{AuthError, BoxFut, UserLoader};
+
+#[derive(Clone)]
+struct User {
+    id: i64,
+}
 
 struct MyUserRepo;
 
-impl RepoUserLoader<i64, User> for MyUserRepo {
-    fn find_by_user_id(
-        &self,
-        user_id: &i64,
-    ) -> BoxFut<'_, Result<Option<User>, AuthError>> {
+impl UserLoader<i64, User> for MyUserRepo {
+    fn load_user(&self, user_id: &i64) -> BoxFut<'_, Result<Option<User>, AuthError>> {
+        let id = *user_id;
         Box::pin(async move {
             // SELECT * FROM users WHERE id = ?
-            Ok(Some(User { id: *user_id }))
+            Ok(Some(User { id }))
         })
     }
 }
@@ -98,28 +105,24 @@ Notes:
 ### 3) Mutate the session using `user_id`
 
 ```rust
-use tetthys_auth::{AuthError, BoxFut};
+use tetthys_auth::{AuthError, BoxFut, UserIdSession};
 
-struct MySessionMutator;
+struct MySession;
 
-impl RequestUserIdSessionMutator<i64> for MySessionMutator {
-    fn sign_in_by_user_id(
-        &self,
-        req: &Request<Body>,
-        user_id: &i64,
-    ) -> BoxFut<'_, Result<(), AuthError>> {
-        Box::pin(async {
-            // Set cookie / session row
+impl UserIdSession<i64> for MySession {
+    fn sign_in_by_user_id(&self, user_id: &i64) -> BoxFut<'_, Result<(), AuthError>> {
+        let id = *user_id;
+        Box::pin(async move {
+            // Persist session (cookie / DB row / etc)
+            // Example: set "sid" cookie + insert session row containing user_id
+            let _ = id;
             Ok(())
         })
     }
 
-    fn sign_out(
-        &self,
-        req: &Request<Body>,
-    ) -> BoxFut<'_, Result<(), AuthError>> {
-        Box::pin(async {
-            // Clear cookie / delete session row
+    fn sign_out(&self) -> BoxFut<'_, Result<(), AuthError>> {
+        Box::pin(async move {
+            // Clear session (remove cookie / delete DB row / etc)
             Ok(())
         })
     }
@@ -131,58 +134,63 @@ Purpose:
 
 ---
 
-## Wiring in Axum (One Time)
+## Wiring Model (Important)
 
-Create shared adapter state:
+`tetthys-auth` needs an `AuthEngine<UserId, User>` **available in the current request scope**.
+
+Engine lookup priority is:
+
+1. Leptos context (when enabled)
+2. TLS fallback (tests / non-Leptos environments)
+
+In real Axum SSR, you typically do **request middleware injection**, so every request gets its own engine (and per-request cache).
+
+---
+
+## Wiring in Axum SSR (Recommended Pattern)
+
+### A) Middleware: build a request-scoped engine and enter scope
+
+Pseudo-pattern:
+
+* Parse cookie/header from the request
+* Create a request-scoped provider that returns the parsed user id
+* Construct `AuthEngine`
+* Enter scope for the duration of the request
+
+Example (conceptual; keep your own cookie/db logic in app):
 
 ```rust
 use std::sync::Arc;
-use tetthys_auth::adapters::leptos_axum_ssr::AuthAdapterState;
+use axum::{http::Request, middleware::Next, response::Response};
+use tetthys_auth::{AuthEngine, FixedUserIdProvider, UserLoader, UserIdSession};
 
-let auth_state = AuthAdapterState::<i64, User>::new(
-    Arc::new(MyUserIdResolver),
-    Arc::new(MyUserRepo),
-    Some(Arc::new(MySessionMutator)),
-);
+pub async fn auth_middleware<B, UserId, User>(
+    req: Request<B>,
+    next: Next<B>,
+    user_loader: Option<Arc<dyn UserLoader<UserId, User> + Send + Sync>>,
+    session: Option<Arc<dyn UserIdSession<UserId> + Send + Sync>>,
+    user_id: Option<UserId>,
+) -> Response
+where
+    UserId: Clone + Send + Sync + 'static,
+    User: Clone + Send + Sync + 'static,
+{
+    // 1) user_id is computed from cookie/header/etc in *your app*.
+    let idp = Arc::new(FixedUserIdProvider::new(user_id))
+        as Arc<dyn tetthys_auth::CurrentUserIdProvider<UserId> + Send + Sync>;
+
+    // 2) per-request engine
+    let engine = Arc::new(AuthEngine::new(idp, user_loader, session));
+
+    // 3) enter TLS scope for this request
+    let _guard = tetthys_auth::scope::ScopeGuard::enter(engine);
+
+    next.run(req).await
+}
 ```
 
-Attach it to your Axum app state.
-
----
-
-## Server Functions Route (Required)
-
-```rust
-use axum::routing::post;
-use tetthys_auth::adapters::leptos_axum_ssr::leptos_server_fns_handler_with_auth;
-
-Router::new()
-    .route(
-        "/api/*fn_name",
-        post(leptos_server_fns_handler_with_auth::<i64, User, AppState>),
-    )
-    .with_state(app_state);
-```
-
-This makes auth helpers work inside `#[server]` functions.
-
----
-
-## SSR Rendering Route (Required)
-
-```rust
-use tetthys_auth::adapters::leptos_axum_ssr::leptos_ssr_render_handler_with_auth;
-
-Router::new().fallback(
-    leptos_ssr_render_handler_with_auth::<i64, User, AppState, _>(
-        app_state,
-        leptos_options,
-        || view! { <App/> },
-    ),
-);
-```
-
-This makes auth helpers work during SSR rendering.
+This makes auth helpers work inside request handling, SSR rendering, and server functions (as long as they run within the same request scope).
 
 ---
 
@@ -222,23 +230,40 @@ auth_sign_out::<i64, User>().await?;
 
 ---
 
+## Testing Without Leptos/Axum
+
+For tests, enter TLS scope explicitly:
+
+```rust
+use std::sync::Arc;
+use tetthys_auth::{AuthEngine, FixedUserIdProvider};
+
+let idp = Arc::new(FixedUserIdProvider::<i64>::new(Some(1)));
+let engine = Arc::new(AuthEngine::new(idp, None, None));
+let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
+
+// Now auth_* helpers work.
+```
+
+---
+
 ## Mental Model (Keep This)
 
 * Authentication = **user_id exists or not**
 * Session = **store user_id**
 * User = **optional materialization**
 * Everything is **request-scoped**
-* No globals, no magic
+* No globals, no magic (you inject scope per request)
 
 ---
 
 ## Common Errors
 
-| Error             | Meaning                                    |
-| ----------------- | ------------------------------------------ |
-| `MissingContext`  | Auth not injected into SSR/server-fns      |
-| `Unauthenticated` | No user_id                                 |
-| `MissingSession`  | sign-in/out called without session mutator |
+| Error             | Meaning                                                             |
+| ----------------- | ------------------------------------------------------------------- |
+| `MissingContext`  | Engine not injected into current scope (middleware/context missing) |
+| `Unauthenticated` | No user_id                                                          |
+| `MissingSession`  | sign-in/out called but engine has no `UserIdSession` configured     |
 
 ---
 
