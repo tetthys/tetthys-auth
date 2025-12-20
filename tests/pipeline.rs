@@ -1,325 +1,417 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
-};
-
-use futures::executor::block_on;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use tetthys_auth::{
-    auth_check, auth_id, auth_require, auth_require_id, auth_sign_in_by_user_id, auth_sign_out,
-    auth_user, AuthEngine, AuthError, BoxFut, ChainUserIdProvider, CurrentUserIdProvider,
-    FixedUserIdProvider, UserIdSession, UserLoader,
+    AuthContext, AuthError, AuthSession, Authorizer, BoxFut, CredentialsVerifier, Policy, Principal,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// ---------- Test domain types ----------
+
+#[derive(Debug, Clone)]
 struct TestUser {
-    id: i64,
+    id: u64,
+    roles: HashSet<String>,
+    perms: HashSet<String>,
 }
 
-// ------------------------------
-// Test providers/loaders/sessions
-// ------------------------------
-
-struct CountingUserIdProvider {
-    calls: Arc<AtomicUsize>,
-    id: Option<i64>,
-    fail: bool,
-}
-
-impl CountingUserIdProvider {
-    fn new(calls: Arc<AtomicUsize>, id: Option<i64>) -> Self {
-        Self { calls, id, fail: false }
+impl TestUser {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            roles: HashSet::new(),
+            perms: HashSet::new(),
+        }
     }
 
-    fn failing(calls: Arc<AtomicUsize>) -> Self {
-        Self { calls, id: None, fail: true }
+    fn with_role(mut self, role: &str) -> Self {
+        self.roles.insert(role.to_string());
+        self
+    }
+
+    fn with_perm(mut self, perm: &str) -> Self {
+        self.perms.insert(perm.to_string());
+        self
     }
 }
 
-impl CurrentUserIdProvider<i64> for CountingUserIdProvider {
-    fn current_user_id(&self) -> BoxFut<'_, Result<Option<i64>, AuthError>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let id = self.id;
-        let fail = self.fail;
+impl Principal for TestUser {
+    type Id = u64;
 
+    fn id(&self) -> Self::Id {
+        self.id
+    }
+}
+
+// ---------- In-memory Session ----------
+
+#[derive(Debug, Default)]
+struct InMemorySession {
+    // English comment: Keep currently signed-in user_id.
+    signed_in: Mutex<Option<u64>>,
+}
+
+impl InMemorySession {
+    fn new() -> Self {
+        Self {
+            signed_in: Mutex::new(None),
+        }
+    }
+
+    fn get(&self) -> Option<u64> {
+        *self.signed_in.lock().unwrap()
+    }
+}
+
+impl AuthSession for InMemorySession {
+    type UserId = u64;
+
+    fn sign_in(&self, user_id: &Self::UserId) -> BoxFut<'_, Result<(), AuthError>> {
+        let uid = *user_id;
         Box::pin(async move {
-            if fail {
-                return Err(AuthError::ProviderFailed("boom".into()));
-            }
-            Ok(id)
-        })
-    }
-}
-
-struct CountingUserLoader {
-    calls: Arc<AtomicUsize>,
-    missing: bool,
-}
-
-impl CountingUserLoader {
-    fn new(calls: Arc<AtomicUsize>) -> Self {
-        Self { calls, missing: false }
-    }
-
-    fn missing(calls: Arc<AtomicUsize>) -> Self {
-        Self { calls, missing: true }
-    }
-}
-
-impl UserLoader<i64, TestUser> for CountingUserLoader {
-    fn load_user(&self, user_id: &i64) -> BoxFut<'_, Result<Option<TestUser>, AuthError>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let id = *user_id;
-        let missing = self.missing;
-
-        Box::pin(async move {
-            if missing {
-                return Ok(None);
-            }
-            Ok(Some(TestUser { id }))
-        })
-    }
-}
-
-#[derive(Clone)]
-struct SharedIdStore {
-    id: Arc<Mutex<Option<i64>>>,
-}
-
-impl SharedIdStore {
-    fn new(initial: Option<i64>) -> Self {
-        Self { id: Arc::new(Mutex::new(initial)) }
-    }
-}
-
-struct StoreUserIdProvider {
-    store: SharedIdStore,
-}
-
-impl CurrentUserIdProvider<i64> for StoreUserIdProvider {
-    fn current_user_id(&self) -> BoxFut<'_, Result<Option<i64>, AuthError>> {
-        let store = self.store.clone();
-        Box::pin(async move {
-            let g = store
-                .id
-                .lock()
-                .map_err(|_| AuthError::ProviderFailed("store poisoned".into()))?;
-            Ok(*g)
-        })
-    }
-}
-
-struct StoreUserIdSession {
-    store: SharedIdStore,
-}
-
-impl UserIdSession<i64> for StoreUserIdSession {
-    fn sign_in_by_user_id(&self, user_id: &i64) -> BoxFut<'_, Result<(), AuthError>> {
-        let store = self.store.clone();
-        let id = *user_id;
-
-        Box::pin(async move {
-            let mut g = store
-                .id
-                .lock()
-                .map_err(|_| AuthError::SessionFailed("store poisoned".into()))?;
-            *g = Some(id);
+            *self.signed_in.lock().unwrap() = Some(uid);
             Ok(())
         })
     }
 
     fn sign_out(&self) -> BoxFut<'_, Result<(), AuthError>> {
-        let store = self.store.clone();
         Box::pin(async move {
-            let mut g = store
-                .id
-                .lock()
-                .map_err(|_| AuthError::SessionFailed("store poisoned".into()))?;
-            *g = None;
+            *self.signed_in.lock().unwrap() = None;
             Ok(())
         })
     }
 }
 
-// ------------------------------
-// Tests
-// ------------------------------
+// ---------- In-memory User Store ----------
 
-#[test]
-fn pipeline_unauthenticated_basics() {
-    // No scope => MissingContext
-    let e = block_on(auth_user::<i64, TestUser>()).unwrap_err();
-    assert!(matches!(e, AuthError::MissingContext));
-
-    // Engine with fixed None
-    let idp = Arc::new(FixedUserIdProvider::<i64>(None))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
-
-    let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
-
-    let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
-
-    let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
-
-    assert_eq!(block_on(auth_check::<i64, TestUser>()).unwrap(), false);
-    assert_eq!(block_on(auth_id::<i64, TestUser>()).unwrap(), None);
-    assert_eq!(block_on(auth_user::<i64, TestUser>()).unwrap(), None);
-
-    let e = block_on(auth_require_id::<i64, TestUser>()).unwrap_err();
-    assert!(matches!(e, AuthError::Unauthenticated));
-
-    let e = block_on(auth_require::<i64, TestUser>()).unwrap_err();
-    assert!(matches!(e, AuthError::Unauthenticated));
+#[derive(Debug, Default)]
+struct UserStore {
+    // English comment: Simple in-memory user repository.
+    users: Mutex<HashMap<u64, TestUser>>,
 }
 
-#[test]
-fn pipeline_authenticated_id_and_user() {
-    let idp = Arc::new(FixedUserIdProvider::<i64>(Some(7)))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+impl UserStore {
+    fn new() -> Self {
+        Self {
+            users: Mutex::new(HashMap::new()),
+        }
+    }
 
-    let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
+    fn insert(&self, user: TestUser) {
+        self.users.lock().unwrap().insert(user.id(), user);
+    }
 
-    let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
-    let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
-
-    assert_eq!(block_on(auth_check::<i64, TestUser>()).unwrap(), true);
-    assert_eq!(block_on(auth_id::<i64, TestUser>()).unwrap(), Some(7));
-    assert_eq!(block_on(auth_user::<i64, TestUser>()).unwrap(), Some(TestUser { id: 7 }));
-    assert_eq!(block_on(auth_require_id::<i64, TestUser>()).unwrap(), 7);
-    assert_eq!(block_on(auth_require::<i64, TestUser>()).unwrap(), TestUser { id: 7 });
+    fn get(&self, id: u64) -> Option<TestUser> {
+        self.users.lock().unwrap().get(&id).cloned()
+    }
 }
 
-#[test]
-fn user_id_chain_provider_order_and_fallback() {
-    let calls_a = Arc::new(AtomicUsize::new(0));
-    let calls_b = Arc::new(AtomicUsize::new(0));
+// ---------- AuthContext implementation ----------
 
-    let p1 = Arc::new(CountingUserIdProvider::new(calls_a.clone(), None))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
-    let p2 = Arc::new(CountingUserIdProvider::new(calls_b.clone(), Some(9)))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
-
-    let chain = Arc::new(ChainUserIdProvider::new(vec![p1, p2]))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
-
-    let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
-
-    let engine = Arc::new(AuthEngine::new(chain, Some(loader), None));
-    let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
-
-    assert_eq!(block_on(auth_id::<i64, TestUser>()).unwrap(), Some(9));
-    assert_eq!(block_on(auth_user::<i64, TestUser>()).unwrap(), Some(TestUser { id: 9 }));
-
-    assert_eq!(calls_a.load(Ordering::SeqCst), 1);
-    assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+#[derive(Clone)]
+struct TestAuthContext {
+    // English comment: Context wires session + user store.
+    session: Arc<InMemorySession>,
+    store: Arc<UserStore>,
 }
 
-#[test]
-fn engine_caches_user_id_and_user_per_request_scope() {
-    let id_calls = Arc::new(AtomicUsize::new(0));
-    let user_calls = Arc::new(AtomicUsize::new(0));
-
-    let idp = Arc::new(CountingUserIdProvider::new(id_calls.clone(), Some(3)))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
-
-    let loader = Arc::new(CountingUserLoader::new(user_calls.clone()))
-        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
-
-    let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
-    let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
-
-    assert_eq!(block_on(auth_check::<i64, TestUser>()).unwrap(), true);
-    assert_eq!(block_on(auth_id::<i64, TestUser>()).unwrap(), Some(3));
-    assert_eq!(block_on(auth_user::<i64, TestUser>()).unwrap(), Some(TestUser { id: 3 }));
-    assert_eq!(block_on(auth_user::<i64, TestUser>()).unwrap(), Some(TestUser { id: 3 }));
-
-    assert_eq!(id_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(user_calls.load(Ordering::SeqCst), 1);
+impl TestAuthContext {
+    fn new(session: Arc<InMemorySession>, store: Arc<UserStore>) -> Self {
+        Self { session, store }
+    }
 }
 
-#[test]
-fn provider_errors_propagate() {
-    let calls = Arc::new(AtomicUsize::new(0));
+impl AuthContext for TestAuthContext {
+    type UserId = u64;
+    type User = TestUser;
 
-    let idp = Arc::new(CountingUserIdProvider::failing(calls.clone()))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+    fn current_user_id(&self) -> BoxFut<'_, Result<Option<Self::UserId>, AuthError>> {
+        let session = self.session.clone();
+        Box::pin(async move { Ok(session.get()) })
+    }
 
-    let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
+    fn current_user(&self) -> BoxFut<'_, Result<Option<Self::User>, AuthError>> {
+        let session = self.session.clone();
+        let store = self.store.clone();
+        Box::pin(async move {
+            let uid = match session.get() {
+                Some(uid) => uid,
+                None => return Ok(None),
+            };
 
-    let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
-    let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
+            let user = store.get(uid).ok_or(AuthError::MissingSession)?;
+            Ok(Some(user))
+        })
+    }
 
-    let e = block_on(auth_id::<i64, TestUser>()).unwrap_err();
-    assert!(matches!(e, AuthError::ProviderFailed(_)));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    fn require_user_id(&self) -> BoxFut<'_, Result<Self::UserId, AuthError>> {
+        let session = self.session.clone();
+        Box::pin(async move { session.get().ok_or(AuthError::Unauthenticated) })
+    }
+
+    fn require_user(&self) -> BoxFut<'_, Result<Self::User, AuthError>> {
+        let session = self.session.clone();
+        let store = self.store.clone();
+        Box::pin(async move {
+            let uid = session.get().ok_or(AuthError::Unauthenticated)?;
+            store.get(uid).ok_or(AuthError::MissingSession)
+        })
+    }
 }
 
-#[test]
-fn user_loader_can_return_none_when_user_missing() {
-    let idp = Arc::new(FixedUserIdProvider::<i64>(Some(10)))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+// ---------- CredentialsVerifier (mock) ----------
 
-    let loader = Arc::new(CountingUserLoader::missing(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
-
-    let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
-    let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
-
-    assert_eq!(block_on(auth_id::<i64, TestUser>()).unwrap(), Some(10));
-    assert_eq!(block_on(auth_user::<i64, TestUser>()).unwrap(), None);
-
-    let e = block_on(auth_require::<i64, TestUser>()).unwrap_err();
-    assert!(matches!(e, AuthError::Unauthenticated));
+#[derive(Debug, Clone)]
+struct TestCredentials {
+    username: String,
+    password: String,
 }
 
-#[test]
-fn sign_in_out_updates_user_id_and_invalidates_cache() {
-    let store = SharedIdStore::new(None);
+#[derive(Clone)]
+struct MockCredentialsVerifier;
 
-    let idp = Arc::new(StoreUserIdProvider { store: store.clone() })
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+impl CredentialsVerifier for MockCredentialsVerifier {
+    type Credentials = TestCredentials;
+    type UserId = u64;
 
-    let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
-
-    let session = Arc::new(StoreUserIdSession { store: store.clone() })
-        as Arc<dyn UserIdSession<i64> + Send + Sync>;
-
-    let engine = Arc::new(AuthEngine::new(idp, Some(loader), Some(session)));
-    let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
-
-    assert_eq!(block_on(auth_check::<i64, TestUser>()).unwrap(), false);
-    assert_eq!(block_on(auth_id::<i64, TestUser>()).unwrap(), None);
-
-    block_on(auth_sign_in_by_user_id::<i64, TestUser>(&42)).unwrap();
-    assert_eq!(block_on(auth_check::<i64, TestUser>()).unwrap(), true);
-    assert_eq!(block_on(auth_id::<i64, TestUser>()).unwrap(), Some(42));
-    assert_eq!(block_on(auth_user::<i64, TestUser>()).unwrap(), Some(TestUser { id: 42 }));
-
-    block_on(auth_sign_out::<i64, TestUser>()).unwrap();
-    assert_eq!(block_on(auth_check::<i64, TestUser>()).unwrap(), false);
-    assert_eq!(block_on(auth_id::<i64, TestUser>()).unwrap(), None);
-    assert_eq!(block_on(auth_user::<i64, TestUser>()).unwrap(), None);
+    fn verify(&self, credentials: &Self::Credentials) -> BoxFut<'_, Result<Self::UserId, AuthError>> {
+        let u = credentials.username.clone();
+        let p = credentials.password.clone();
+        Box::pin(async move {
+            // English comment: Extremely simplified verifier for tests.
+            if u == "admin" && p == "pw" {
+                Ok(1)
+            } else if u == "user" && p == "pw" {
+                Ok(2)
+            } else {
+                Err(AuthError::InvalidCredentials)
+            }
+        })
+    }
 }
 
-#[test]
-fn sign_in_out_missing_session_is_an_error() {
-    let idp = Arc::new(FixedUserIdProvider::<i64>(None))
-        as Arc<dyn CurrentUserIdProvider<i64> + Send + Sync>;
+// ---------- Authorizer (mock) ----------
 
-    let loader = Arc::new(CountingUserLoader::new(Arc::new(AtomicUsize::new(0))))
-        as Arc<dyn UserLoader<i64, TestUser> + Send + Sync>;
+#[derive(Clone)]
+struct MockAuthorizer;
 
-    let engine = Arc::new(AuthEngine::new(idp, Some(loader), None));
-    let _g = tetthys_auth::scope::ScopeGuard::enter(engine);
+impl Authorizer for MockAuthorizer {
+    type User = TestUser;
 
-    let e = block_on(auth_sign_in_by_user_id::<i64, TestUser>(&1)).unwrap_err();
-    assert!(matches!(e, AuthError::MissingSession));
+    fn has_role(&self, user: &Self::User, role: &str) -> BoxFut<'_, Result<bool, AuthError>> {
+        let role = role.to_string();
+        let u = user.clone();
+        Box::pin(async move { Ok(u.roles.contains(&role)) })
+    }
 
-    let e = block_on(auth_sign_out::<i64, TestUser>()).unwrap_err();
-    assert!(matches!(e, AuthError::MissingSession));
+    fn has_permission(
+        &self,
+        user: &Self::User,
+        permission: &str,
+    ) -> BoxFut<'_, Result<bool, AuthError>> {
+        let perm = permission.to_string();
+        let u = user.clone();
+        Box::pin(async move { Ok(u.perms.contains(&perm)) })
+    }
+}
+
+// ---------- Policies ----------
+
+#[derive(Clone)]
+struct RequireAuthenticated;
+
+impl Policy for RequireAuthenticated {
+    type Ctx = TestAuthContext;
+
+    fn check(&self, ctx: &Self::Ctx) -> BoxFut<'_, Result<(), AuthError>> {
+        let ctx = ctx.clone();
+        Box::pin(async move {
+            ctx.require_user_id().await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct RequireRole {
+    role: String,
+    authorizer: MockAuthorizer,
+}
+
+impl RequireRole {
+    fn new(role: &str, authorizer: MockAuthorizer) -> Self {
+        Self {
+            role: role.to_string(),
+            authorizer,
+        }
+    }
+}
+
+impl Policy for RequireRole {
+    type Ctx = TestAuthContext;
+
+    fn check(&self, ctx: &Self::Ctx) -> BoxFut<'_, Result<(), AuthError>> {
+        let ctx = ctx.clone();
+        let role = self.role.clone();
+        let authz = self.authorizer.clone();
+        Box::pin(async move {
+            let user = ctx.require_user().await?;
+            let ok = authz.has_role(&user, &role).await?;
+            if ok {
+                Ok(())
+            } else {
+                Err(AuthError::Forbidden)
+            }
+        })
+    }
+}
+
+// ---------- Pipeline helper ----------
+
+async fn auth_pipeline_login_and_authorize(
+    ctx: &TestAuthContext,
+    session: &InMemorySession,
+    verifier: &MockCredentialsVerifier,
+    creds: &TestCredentials,
+    policy: &dyn Policy<Ctx = TestAuthContext>,
+) -> Result<(), AuthError> {
+    // English comment: 1) verify credentials => user_id
+    let user_id = verifier.verify(creds).await?;
+
+    // English comment: 2) persist session
+    session.sign_in(&user_id).await?;
+
+    // English comment: 3) enforce policy
+    policy.check(ctx).await?;
+
+    Ok(())
+}
+
+// ---------- Tests ----------
+
+#[tokio::test]
+async fn pipeline_denies_when_unauthenticated() {
+    let session = Arc::new(InMemorySession::new());
+    let store = Arc::new(UserStore::new());
+
+    // English comment: Store a user, but do not sign in.
+    store.insert(TestUser::new(1).with_role("admin"));
+
+    let ctx = TestAuthContext::new(session.clone(), store);
+    let policy = RequireAuthenticated;
+
+    let err = policy.check(&ctx).await.unwrap_err();
+    match err {
+        AuthError::Unauthenticated => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn pipeline_login_then_require_authenticated_passes() {
+    let session = Arc::new(InMemorySession::new());
+    let store = Arc::new(UserStore::new());
+
+    store.insert(TestUser::new(1).with_role("admin"));
+
+    let ctx = TestAuthContext::new(session.clone(), store);
+    let verifier = MockCredentialsVerifier;
+    let policy = RequireAuthenticated;
+
+    let creds = TestCredentials {
+        username: "admin".to_string(),
+        password: "pw".to_string(),
+    };
+
+    let res = auth_pipeline_login_and_authorize(&ctx, &session, &verifier, &creds, &policy).await;
+    assert!(res.is_ok());
+
+    // English comment: Ensure session is set and user is loadable.
+    let uid = ctx.current_user_id().await.unwrap();
+    assert_eq!(uid, Some(1));
+
+    let user = ctx.current_user().await.unwrap().unwrap();
+    assert_eq!(user.id(), 1);
+}
+
+#[tokio::test]
+async fn pipeline_login_but_missing_role_is_forbidden() {
+    let session = Arc::new(InMemorySession::new());
+    let store = Arc::new(UserStore::new());
+
+    // English comment: user 2 exists but not admin.
+    store.insert(TestUser::new(2).with_role("user"));
+
+    let ctx = TestAuthContext::new(session.clone(), store);
+    let verifier = MockCredentialsVerifier;
+
+    let policy = RequireRole::new("admin", MockAuthorizer);
+
+    let creds = TestCredentials {
+        username: "user".to_string(),
+        password: "pw".to_string(),
+    };
+
+    let err =
+        auth_pipeline_login_and_authorize(&ctx, &session, &verifier, &creds, &policy)
+            .await
+            .unwrap_err();
+
+    match err {
+        AuthError::Forbidden => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn pipeline_invalid_credentials_fails_before_session() {
+    let session = Arc::new(InMemorySession::new());
+    let store = Arc::new(UserStore::new());
+
+    // English comment: Insert some users, but verifier decides.
+    store.insert(TestUser::new(1).with_role("admin"));
+    store.insert(TestUser::new(2).with_role("user"));
+
+    let ctx = TestAuthContext::new(session.clone(), store);
+    let verifier = MockCredentialsVerifier;
+    let policy = RequireAuthenticated;
+
+    let creds = TestCredentials {
+        username: "admin".to_string(),
+        password: "wrong".to_string(),
+    };
+
+    let err =
+        auth_pipeline_login_and_authorize(&ctx, &session, &verifier, &creds, &policy)
+            .await
+            .unwrap_err();
+
+    match err {
+        AuthError::InvalidCredentials => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
+
+    // English comment: Ensure sign-in never happened.
+    assert_eq!(ctx.current_user_id().await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn pipeline_sign_out_clears_context() {
+    let session = Arc::new(InMemorySession::new());
+    let store = Arc::new(UserStore::new());
+
+    store.insert(TestUser::new(1).with_role("admin"));
+
+    let ctx = TestAuthContext::new(session.clone(), store);
+
+    session.sign_in(&1).await.unwrap();
+    assert_eq!(ctx.current_user_id().await.unwrap(), Some(1));
+
+    session.sign_out().await.unwrap();
+    assert_eq!(ctx.current_user_id().await.unwrap(), None);
+
+    let err = ctx.require_user_id().await.unwrap_err();
+    match err {
+        AuthError::Unauthenticated => {}
+        other => panic!("unexpected error: {:?}", other),
+    }
 }

@@ -1,38 +1,16 @@
 [package]
 name = "tetthys-auth"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 
-description = "Framework-agnostic authentication/authorization core for Rust applications."
+description = "Abtract authentication crate for rust web apps."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/tetthys/tetthys-auth"
-keywords = ["auth", "authentication", "authorization"]
-categories = ["authentication"]
-
-[features]
-default = []
-
-# Enables Leptos-related request scope helpers (used by cfg(feature="leptos") blocks).
-leptos = ["dep:leptos"]
-
-# Enables Leptos + Axum SSR adapter module(s).
-# Keep leptos as an explicit feature so cfg(feature="leptos") stays consistent.
-axum-ssr = [
-  "leptos",
-  "dep:axum",
-  "dep:axum-extra",
-  "dep:leptos_axum",
-]
+keywords = ["auth", "authentication"]
+categories = ["auth", "authentication"]
 
 [dependencies]
-# --- Leptos scope helpers (feature-gated) ---
-leptos = { version = "0.8.0", optional = true }
-
-# --- Adapter-only deps (feature-gated) ---
-axum = { version = "0.8.0", optional = true }
-axum-extra = { version = "0.10", features = ["cookie"], optional = true }
-leptos_axum = { version = "0.8.0", optional = true }
 
 [dev-dependencies]
-futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
